@@ -1,4 +1,4 @@
-const STORAGE_KEY = 'story-architect.document.v1';
+export const STORAGE_KEY = 'story-architect.document.v1';
 
 export interface StorageService {
   read(): string | null;

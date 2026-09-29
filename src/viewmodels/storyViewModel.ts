@@ -12,6 +12,13 @@ import type { StoryRepository } from '../repositories/storyRepository';
 
 export type ViewModelStatus = 'loading' | 'ready' | 'editing' | 'error' | 'completed';
 
+/** 打开阶段的存储告警；存在时原内容仍留在存储中，不会被自动覆盖。 */
+export interface LoadWarning {
+  kind: 'repaired' | 'corrupt';
+  issues: string[];
+  dismissed: boolean;
+}
+
 export interface StoryViewState {
   status: ViewModelStatus;
   story: StoryDocument | null;
@@ -20,6 +27,9 @@ export interface StoryViewState {
   error: string;
   search: string;
   activeSection: 'overview' | 'characters' | 'clues';
+  loadWarning: LoadWarning | null;
+  /** 恢复模式下编辑只留在页面内存中，尚未写入存储。 */
+  hasUnpersistedEdits: boolean;
 }
 
 type Listener = () => void;
@@ -33,6 +43,8 @@ export class StoryViewModel {
     error: '',
     search: '',
     activeSection: 'overview',
+    loadWarning: null,
+    hasUnpersistedEdits: false,
   };
   private readonly listeners = new Set<Listener>();
 
@@ -48,12 +60,34 @@ export class StoryViewModel {
   }
 
   initialize(): void {
+    let outcome: ReturnType<StoryRepository['loadResult']>;
     try {
-      const story = this.repository.load();
-      this.setState({ status: story.status === 'complete' ? 'completed' : 'ready', story, stats: getStats(story), error: '' });
+      outcome = this.repository.loadResult();
     } catch {
       this.setState({ status: 'error', error: '故事读取失败，请重置为示例项目。' });
+      return;
     }
+
+    if (outcome.outcome === 'empty') {
+      const story = createStarterStory();
+      this.setState({ status: 'ready', story, stats: getStats(story), error: '', loadWarning: null });
+      return;
+    }
+
+    const { story } = outcome;
+    const status = story.status === 'complete' ? 'completed' : 'ready';
+    if (outcome.outcome === 'intact') {
+      this.setState({ status, story, stats: getStats(story), error: '', loadWarning: null });
+      return;
+    }
+
+    this.setState({
+      status,
+      story,
+      stats: getStats(story),
+      error: '',
+      loadWarning: { kind: outcome.outcome, issues: outcome.issues, dismissed: false },
+    });
   }
 
   setSearch(search: string): void {
@@ -153,14 +187,53 @@ export class StoryViewModel {
   }
 
   completeProject(): void {
-    this.updateStory((story) => ({ ...story, status: 'complete' }));
-    this.setState({ status: 'completed', notice: '项目已标记为完成，仍可继续编辑' });
+    const story = this.requireStory();
+    const completed = { ...story, status: 'complete' as const };
+    if (this.state.loadWarning) {
+      // 恢复模式下不写存储：标记只保留在页面内存中，刷新后以存储里的状态重新打开
+      this.setState({
+        story: completed,
+        stats: getStats(completed),
+        status: 'completed',
+        hasUnpersistedEdits: true,
+        notice: '完成标记只保留在当前页面，保存修复版后才会写入存储。',
+      });
+      return;
+    }
+    if (!this.persist(completed)) return;
+    this.setState({ story: completed, stats: getStats(completed), status: 'completed', notice: '项目已标记为完成，仍可继续编辑' });
   }
 
   resetProject(): void {
     const story = createStarterStory();
-    this.persist(story);
-    this.setState({ status: 'ready', story, stats: getStats(story), notice: '已恢复示例项目', error: '' });
+    if (!this.persist(story)) return;
+    this.setState({
+      status: 'ready',
+      story,
+      stats: getStats(story),
+      notice: '已恢复示例项目，存储中的原内容已被示例内容覆盖。',
+      error: '',
+      loadWarning: null,
+      hasUnpersistedEdits: false,
+    });
+  }
+
+  /** 收起告警横幅；原内容仍保留在存储中，自动保存继续停用。 */
+  dismissLoadWarning(): void {
+    const warning = this.state.loadWarning;
+    if (!warning) return;
+    this.setState({ loadWarning: { ...warning, dismissed: true } });
+  }
+
+  /** 作者确认后，把修复后的内容显式写回存储（恢复模式下允许覆盖原内容的途径之一）。 */
+  saveRecoveredStory(): void {
+    const story = this.requireStory();
+    if (!this.persist(story)) return;
+    this.setState({
+      notice: '修复后的内容已保存到浏览器，存储中的原内容已被覆盖。',
+      loadWarning: null,
+      hasUnpersistedEdits: false,
+    });
   }
 
   get visibleCharacters(): StoryCharacter[] {
@@ -192,15 +265,29 @@ export class StoryViewModel {
 
   private updateStory(updater: (story: StoryDocument) => StoryDocument, showEditing = true): void {
     const story = updater(this.requireStory());
-    this.persist(story);
+    if (this.state.loadWarning) {
+      // 恢复模式下绝不自动写回：原内容留在存储里，编辑先保留在页面内存中。
+      this.setState({
+        story,
+        stats: getStats(story),
+        status: showEditing ? 'editing' : this.state.status,
+        error: '',
+        hasUnpersistedEdits: true,
+      });
+      return;
+    }
+    if (!this.persist(story)) return;
     this.setState({ story, stats: getStats(story), status: showEditing ? 'editing' : this.state.status, error: '' });
   }
 
-  private persist(story: StoryDocument): void {
+  /** 写回存储。返回 false 表示写入失败（调用方不得清空内存中的编辑）。 */
+  private persist(story: StoryDocument): boolean {
     try {
       this.repository.save({ ...story, updatedAt: new Date().toISOString() });
+      return true;
     } catch {
       this.setState({ status: 'error', error: '保存失败，但当前编辑仍保留在页面中。' });
+      return false;
     }
   }
 
