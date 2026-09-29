@@ -49,8 +49,34 @@ export class StoryViewModel {
 
   initialize(): void {
     try {
-      const story = this.repository.load();
-      this.setState({ status: story.status === 'complete' ? 'completed' : 'ready', story, stats: getStats(story), error: '' });
+      const result = this.repository.load();
+      if (result.outcome === 'fallback') {
+        this.setState({
+          status: 'ready',
+          story: result.story,
+          stats: getStats(result.story),
+          notice:
+            '读取到的故事内容无法识别，已先打开示例项目。原始内容仍保留在浏览器存储中，未被覆盖；可清理浏览器本站点数据后重试。',
+          error: '',
+        });
+        return;
+      }
+      if (result.outcome === 'repaired') {
+        this.setState({
+          status: result.story.status === 'complete' ? 'completed' : 'ready',
+          story: result.story,
+          stats: getStats(result.story),
+          notice: `读取到的故事内容不完整（${result.issues.length} 处），已按缺失部分补全后打开。原始内容仍保留在浏览器存储中，未被覆盖；如需重置可点击「恢复示例项目」。`,
+          error: '',
+        });
+        return;
+      }
+      this.setState({
+        status: result.story.status === 'complete' ? 'completed' : 'ready',
+        story: result.story,
+        stats: getStats(result.story),
+        error: '',
+      });
     } catch {
       this.setState({ status: 'error', error: '故事读取失败，请重置为示例项目。' });
     }
